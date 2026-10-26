@@ -1,1 +1,132 @@
+name: Cape GLM archive
 
+# Extracts GOES-East GLM flashes over the CloudScope map, one file per month, into the published
+# site's data/ folder: https://<owner>.github.io/<repo>/data/glm_YYYYMM.npz. Both climatologies read
+# these instead of the raw GLM archive. Months already published are skipped unless "rerun" is set.
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "First month (YYYY-MM). GOES-16 GLM begins 2018-02."
+        default: "2020-10"
+      end:
+        description: "Last month (YYYY-MM)"
+        default: "2025-12"
+      rerun:
+        description: "Re-extract months already published"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      months: ${{ steps.p.outputs.months }}
+      count: ${{ steps.p.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+        continue-on-error: true
+        with: { ref: gh-pages, path: site }
+      - id: p
+        env:
+          START: ${{ inputs.start }}
+          END: ${{ inputs.end }}
+          RERUN: ${{ inputs.rerun }}
+        run: |
+          python3 - <<'PY'
+          import glob, json, os
+          y, m = map(int, os.environ["START"].split("-")); ey, em = map(int, os.environ["END"].split("-"))
+          have = {os.path.basename(f)[4:10] for f in glob.glob("site/data/glm_*.npz")}
+          rerun = os.environ.get("RERUN", "false").lower() == "true"
+          out = []
+          while (y, m) <= (ey, em):
+              if rerun or f"{y:04d}{m:02d}" not in have:
+                  out.append(f"{y:04d}-{m:02d}")
+              m += 1
+              if m == 13: y, m = y + 1, 1
+          print(f"{len(out)} month(s) to extract: {out}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fp:
+              fp.write(f"months={json.dumps(out)}\ncount={len(out)}\n")
+          PY
+
+  extract:
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      # 8, not 20: a free account runs at most 20 jobs at once across ALL repos. At 20, two
+      # climatology runs filled every slot and the live pages' 5-minute jobs never got a runner
+      # (Oct 2026). 8 per heavy workflow leaves room for the live sites.
+      max-parallel: 8
+      matrix:
+        month: ${{ fromJson(needs.plan.outputs.months) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - run: pip install -r requirements.txt
+      # ~130,000 files a month: downloaded on 16 threads per process, parsed serially (HDF5 is not
+      # thread-safe), four processes. The log prints files/s every 24 hours of data.
+      - name: Extract ${{ matrix.month }}
+        run: python glm_prep.py ${{ matrix.month }} --procs 4 --out out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: glm-${{ matrix.month }}
+          path: out/*.npz
+          retention-days: 7
+
+  publish:
+    needs: [plan, extract]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        continue-on-error: true
+        with: { ref: gh-pages, path: site }
+      - run: mkdir -p site/data
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with: { pattern: "glm-*", merge-multiple: true, path: site/data }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install -q numpy
+      - name: Index
+        run: |
+          python3 - <<'PY'
+          import glob, json, os, numpy as np
+          rows = []
+          for f in sorted(glob.glob("site/data/glm_*.npz")):
+              z = np.load(f)
+              n = len(z["file_t"])
+              rows.append({"month": str(z["month"]), "files": n, "read_pct": round(100 * float(z["file_ok"].mean()), 2) if n else 0,
+                           "flashes": int(len(z["flash_t"])), "mb": round(os.path.getsize(f) / 1e6, 2),
+                           "satellites": sorted(set(z["satellite"].tolist()))})
+          json.dump({"months": rows}, open("site/data/index.json", "w"), indent=1)
+          tr = "".join(f"<tr><td>{r['month']}</td><td>{r['files']:,}</td><td>{r['read_pct']}%</td><td>{r['flashes']:,}</td>"
+                       f"<td>{'/'.join(r['satellites'])}</td><td>{r['mb']}</td></tr>" for r in rows)
+          open("site/index.html", "w").write(
+              "<!doctype html><meta charset=utf-8><title>Cape GLM archive</title>"
+              "<style>body{font:14px system-ui;margin:24px;background:#111a25;color:#e8eef3}td,th{padding:4px 10px;text-align:right}"
+              "th{color:#8fa3b6}</style><h2>Cape GLM archive</h2><p>GOES-East GLM flashes (quality flag 0) over 27.6-29.6 N, "
+              "81.6-79.6 W plus 25 nmi, one file per month in <code>data/glm_YYYYMM.npz</code>, read by the CloudScope "
+              "climatologies.</p><table><tr><th>month</th><th>GLM files</th><th>read</th><th>flashes kept</th><th>satellite</th>"
+              f"<th>MB</th></tr>{tr}</table>")
+          print(f"{len(rows)} months indexed")
+          PY
+          touch site/.nojekyll
+      - name: Publish
+        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+        run: |
+          cd site
+          rm -rf .git
+          git init -q && git checkout -q -b gh-pages
+          git add -A
+          git -c user.name="cloudscope-bot" -c user.email="actions@users.noreply.github.com" \
+            commit -qm "GLM archive $(date -u '+%Y-%m-%d %H:%MZ')"
+          git push -fq "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" gh-pages
